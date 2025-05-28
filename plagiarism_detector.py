@@ -28,6 +28,11 @@ from sentence_transformers import SentenceTransformer
 # CLASSE PRINCIPALE - DÉTECTEUR DE PLAGIAT
 # ============================================================================
 import joblib
+st.set_page_config(
+    page_title="Détecteur de Plagiat IA",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # Charger une seule fois
 if 'svm_model' not in st.session_state:
@@ -242,11 +247,6 @@ class PlagiarismDetector:
 # ============================================================================
 
 # Configuration de la page
-st.set_page_config(
-    page_title="Détecteur de Plagiat IA",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # Titre principal avec style
 st.markdown("""
