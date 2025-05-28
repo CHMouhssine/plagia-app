@@ -45,7 +45,7 @@ if 'scaler' not in st.session_state:
 if 'sbert_model' not in st.session_state:
     st.session_state.sbert_model = SentenceTransformer('all-MiniLM-L6-v2')  # same as training
 
-st.write("Type du scaler chargé :", type(st.session_state.scaler))
+
 
 
 def detect_plagiarism_svm(documents, model, scaler, threshold):
