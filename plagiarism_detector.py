@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 DÉTECTEUR DE PLAGIAT COMPLET AVEC INTERFACE STREAMLIT
-Installation: pip install streamlit scikit-learn plotly pandas numpy
+Installation: pip install streamlit scikit-learn plotly pandas numpy tensorflow
 Exécution: streamlit run app.py
 """
 import zipfile
@@ -23,6 +23,8 @@ from collections import Counter
 import warnings
 warnings.filterwarnings('ignore')
 from sentence_transformers import SentenceTransformer
+import tensorflow as tf
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 # ============================================================================
 # CLASSE PRINCIPALE - DÉTECTEUR DE PLAGIAT
@@ -34,49 +36,200 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Charger une seule fois
+# Charger les modèles une seule fois
 if 'svm_model' not in st.session_state:
-    st.session_state.svm_model = joblib.load("svm_model.joblib")
+    try:
+        st.session_state.svm_model = joblib.load("svm_model2.joblib")
+    except FileNotFoundError:
+        st.session_state.svm_model = None
+        st.warning("Modèle SVM non trouvé (svm_model2.joblib)")
 
 if 'scaler' not in st.session_state:
-    st.session_state.scaler = joblib.load("scaler.joblib")
-
+    try:
+        st.session_state.scaler = joblib.load("scaler2.joblib")
+    except FileNotFoundError:
+        st.session_state.scaler = None
+        st.warning("Scaler non trouvé (scaler2.joblib)")
 
 if 'sbert_model' not in st.session_state:
-    st.session_state.sbert_model = SentenceTransformer('all-MiniLM-L6-v2')  # same as training
+    try:
+        st.session_state.sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+    except Exception as e:
+        st.session_state.sbert_model = None
+        st.warning(f"Modèle SBERT non disponible: {e}")
 
+# Charger le modèle LSTM et le tokenizer
+if 'lstm_model' not in st.session_state:
+    try:
+        st.session_state.lstm_model = tf.keras.models.load_model("lstm_model2.h5")
+    except FileNotFoundError:
+        st.session_state.lstm_model = None
+        st.warning("Modèle LSTM non trouvé (lstm_model2.h5)")
 
+if 'tokenizer' not in st.session_state:
+    try:
+        st.session_state.tokenizer = joblib.load("tokenizer2.joblib")
+    except FileNotFoundError:
+        st.session_state.tokenizer = None
+        st.warning("Tokenizer non trouvé (tokenizer2.joblib)")
 
+def create_similarity_features(emb1, emb2):
+    cosine_sim = np.sum(emb1 * emb2, axis=1).reshape(-1, 1)
+    euclidean_dist = np.linalg.norm(emb1 - emb2, axis=1).reshape(-1, 1)
+    manhattan_dist = np.sum(np.abs(emb1 - emb2), axis=1).reshape(-1, 1)
+
+    abs_diff = np.abs(emb1 - emb2)
+    variances = np.var(abs_diff, axis=0)
+    top50_idx = np.argsort(variances)[-50:]  # ✅ comme à l'entraînement
+
+    prod_top = (emb1 * emb2)[:, top50_idx]
+    diff_top = abs_diff[:, top50_idx]
+
+    stats = np.concatenate([
+        np.max(abs_diff, axis=1).reshape(-1, 1),
+        np.min(abs_diff, axis=1).reshape(-1, 1),
+        np.mean(abs_diff, axis=1).reshape(-1, 1),
+        np.std(abs_diff, axis=1).reshape(-1, 1)
+    ], axis=1)
+
+    return np.concatenate([
+        cosine_sim, euclidean_dist, manhattan_dist,
+        diff_top, prod_top, stats
+    ], axis=1)
 
 def detect_plagiarism_svm(documents, model, scaler, threshold):
-        # Extraire les contenus
-        texts = [doc['processed_content'] for doc in documents]
+    if model is None or scaler is None or st.session_state.sbert_model is None:
+        st.error("Modèle SVM, scaler ou SBERT non disponible")
+        return []
+    
+    texts = [doc['processed_content'] for doc in documents]
+    titles = [doc['title'] for doc in documents]
 
-        # Re-vectoriser avec le même scaler que lors de l'entraînement
-        X = scaler.transform(texts)
+    # Embeddings SBERT
+    emb = st.session_state.sbert_model.encode(texts, normalize_embeddings=True)
 
-        similarities = []
-        n_docs = len(documents)
-        for i in range(n_docs):
-            for j in range(i + 1, n_docs):
-                # Créer la différence vectorielle ou concaténer les deux
-                pair_features = np.abs(X[i] - X[j])  # ou np.concatenate([X[i], X[j]])
-                pair_features = pair_features.reshape(1, -1)
+    similarities = []
+    n_docs = len(texts)
+    for i in range(n_docs):
+        for j in range(i + 1, n_docs):
+            emb1 = emb[i].reshape(1, -1)
+            emb2 = emb[j].reshape(1, -1)
 
-                pred = model.predict(pair_features)[0]
-                prob = getattr(model, "predict_proba", lambda x: [[0.0, 1.0]])(pair_features)[0][1]
+            # Créer les features avancées
+            feats = create_similarity_features(emb1, emb2)
+            feats_scaled = scaler.transform(feats)
 
+            pred = model.predict(feats_scaled)[0]
+            prob = model.predict_proba(feats_scaled)[0][1]
+
+            similarities.append({
+                'doc1_id': i,
+                'doc2_id': j,
+                'doc1_title': titles[i],
+                'doc2_title': titles[j],
+                'similarity': prob,
+                'is_plagiarism': pred == 1,
+                'percentage': prob * 100
+            })
+
+    return sorted(similarities, key=lambda x: x['similarity'], reverse=True)
+
+def detect_plagiarism_lstm(documents, model, tokenizer, threshold, max_length=40):
+    """
+    Détection de plagiat utilisant le modèle LSTM
+    
+    Args:
+        documents: Liste des documents
+        model: Modèle LSTM chargé
+        tokenizer: Tokenizer pour la vectorisation
+        threshold: Seuil de détection
+        max_length: Longueur maximale des séquences (doit correspondre à l'entraînement)
+    
+    Returns:
+        Liste des résultats de similarité
+    """
+    if model is None or tokenizer is None:
+        st.error("Modèle LSTM ou tokenizer non disponible")
+        return []
+    
+    texts = [doc['processed_content'] for doc in documents]
+    titles = [doc['title'] for doc in documents]
+
+    similarities = []
+    n_docs = len(texts)
+    
+    for i in range(n_docs):
+        for j in range(i + 1, n_docs):
+            # Préparer les textes pour le modèle LSTM
+            text1 = texts[i]
+            text2 = texts[j]
+            
+            # Tokenisation et padding - SÉPARÉMENT comme dans l'entraînement
+            seq1 = tokenizer.texts_to_sequences([text1])
+            seq2 = tokenizer.texts_to_sequences([text2])
+            
+            # Padding des séquences avec les mêmes paramètres qu'à l'entraînement
+            padded_seq1 = pad_sequences(seq1, maxlen=max_length, padding='post', truncating='post')
+            padded_seq2 = pad_sequences(seq2, maxlen=max_length, padding='post', truncating='post')
+            
+            # Préparer l'entrée pour le modèle 
+            # Le modèle attend probablement deux entrées séparées [X1, X2]
+            try:
+                # Si votre modèle utilise deux entrées séparées (architecture siamoise)
+                prediction = model.predict([padded_seq1, padded_seq2], verbose=0)[0][0]
+                
+                # OU si votre modèle attend une seule entrée concaténée:
+                # model_input = np.concatenate([padded_seq1, padded_seq2], axis=1)
+                # prediction = model.predict(model_input, verbose=0)[0][0]
+                
                 similarities.append({
                     'doc1_id': i,
                     'doc2_id': j,
-                    'doc1_title': documents[i]['title'],
-                    'doc2_title': documents[j]['title'],
-                    'similarity': prob,
-                    'is_plagiarism': pred == 1,
-                    'percentage': prob * 100
+                    'doc1_title': titles[i],
+                    'doc2_title': titles[j],
+                    'similarity': prediction,
+                    'is_plagiarism': prediction > threshold,
+                    'percentage': prediction * 100
                 })
+            except Exception as e:
+                st.error(f"Erreur lors de la prédiction LSTM: {e}")
+                continue
 
-        return sorted(similarities, key=lambda x: x['similarity'], reverse=True)
+    return sorted(similarities, key=lambda x: x['similarity'], reverse=True)
+def detect_plagiarism_sbert(documents, threshold):
+    """
+    Détection de plagiat utilisant SBERT
+    """
+    if st.session_state.sbert_model is None:
+        st.error("Modèle SBERT non disponible")
+        return []
+    
+    texts = [doc['processed_content'] for doc in documents]
+    titles = [doc['title'] for doc in documents]
+
+    # Embeddings SBERT
+    embeddings = st.session_state.sbert_model.encode(texts, normalize_embeddings=True)
+    
+    similarities = []
+    n_docs = len(texts)
+    
+    for i in range(n_docs):
+        for j in range(i + 1, n_docs):
+            # Calcul de la similarité cosinus
+            similarity_score = np.dot(embeddings[i], embeddings[j])
+            
+            similarities.append({
+                'doc1_id': i,
+                'doc2_id': j,
+                'doc1_title': titles[i],
+                'doc2_title': titles[j],
+                'similarity': similarity_score,
+                'is_plagiarism': similarity_score > threshold,
+                'percentage': similarity_score * 100
+            })
+
+    return sorted(similarities, key=lambda x: x['similarity'], reverse=True)
+
 class PlagiarismDetector:
     """
     Détecteur de plagiat utilisant TF-IDF et similarité cosinus
@@ -216,8 +369,6 @@ class PlagiarismDetector:
 
         return df[['doc1_title', 'doc2_title', 'similarity_percentage', 'is_plagiarism']]
 
-
-
     def get_vocabulary_stats(self, top_n=20):
         """
         Retourne les statistiques sur le vocabulaire
@@ -246,8 +397,6 @@ class PlagiarismDetector:
 # INTERFACE STREAMLIT
 # ============================================================================
 
-# Configuration de la page
-
 # Titre principal avec style
 st.markdown("""
 <div style="text-align: center; padding: 2rem 0;">
@@ -255,7 +404,7 @@ st.markdown("""
          Détecteur de Plagiat IA
     </h1>
     <p style="color: #5D6D7E; font-size: 1.2rem;">
-        Analyse de similarité textuelle basée sur TF-IDF et similarité cosinus
+        Analyse de similarité textuelle avec multiple modèles IA
     </p>
 </div>
 """, unsafe_allow_html=True)
@@ -284,14 +433,35 @@ st.session_state.detector.threshold = threshold / 100
 # Section d'ajout de documents
 st.sidebar.header("🧠 Choix du Modèle de Similarité")
 
+# Vérifier la disponibilité des modèles
+available_models = ["Cosine Similarity (TF-IDF)"]
+if st.session_state.sbert_model is not None:
+    available_models.append("SBERT")
+if st.session_state.lstm_model is not None and st.session_state.tokenizer is not None:
+    available_models.append("LSTM")
+if st.session_state.svm_model is not None and st.session_state.scaler is not None:
+    available_models.append("SVM")
+
 selected_model = st.sidebar.selectbox(
     "Modèle de Similarité",
-    ["Cosine Similarity (TF-IDF)", "SBERT", "LSTM", "SVM"],
+    available_models,
     help="Choisissez la méthode utilisée pour comparer les documents"
 )
 
 # Stocker le modèle choisi dans la session
 st.session_state["selected_model"] = selected_model
+
+# Paramètres spécifiques au modèle LSTM
+# Paramètres spécifiques au modèle LSTM
+if selected_model == "LSTM":
+    max_sequence_length = st.sidebar.slider(
+        "Longueur maximale des séquences (LSTM)",
+        min_value=20,
+        max_value=100,
+        value=40,  # Changé de 100 à 40 pour correspondre à votre entraînement
+        help="Longueur maximale des séquences pour le modèle LSTM (doit correspondre à l'entraînement)"
+    )
+    st.session_state["max_sequence_length"] = max_sequence_length
 
 st.sidebar.header("📄 Gestion des Documents")
 
@@ -314,55 +484,53 @@ with st.sidebar.expander("➕ Ajouter un Document", expanded=True):
                 st.error("Veuillez remplir le titre et le contenu")
 
 # Charger des exemples
-    st.sidebar.button("📚 Charger des Exemples")
-    uploaded_files = st.sidebar.file_uploader(
-        "Uploader un ou plusieurs fichiers (TXT, PDF, DOCX ou ZIP)",
-        type=['txt', 'pdf', 'docx', 'zip'],
-        accept_multiple_files=True
-    )
+st.sidebar.button("📚 Charger des Exemples")
+uploaded_files = st.sidebar.file_uploader(
+    "Uploader un ou plusieurs fichiers (TXT, PDF, DOCX ou ZIP)",
+    type=['txt', 'pdf', 'docx', 'zip'],
+    accept_multiple_files=True
+)
 
-    if uploaded_files:
-        st.session_state.detector = PlagiarismDetector(threshold / 100)
-        st.session_state.documents = []
+if uploaded_files:
+    st.session_state.detector = PlagiarismDetector(threshold / 100)
+    st.session_state.documents = []
 
+    def extract_text(file):
+        file_type = file.name.split('.')[-1].lower()
+        if file_type == 'txt':
+            return file.read().decode('utf-8', errors='ignore')
+        elif file_type == 'pdf':
+            reader = PyPDF2.PdfReader(file)
+            return '\n'.join(page.extract_text() or '' for page in reader.pages)
+        elif file_type == 'docx':
+            doc = Document(file)
+            return '\n'.join(paragraph.text for paragraph in doc.paragraphs)
+        return ''
 
-        def extract_text(file):
-            file_type = file.name.split('.')[-1].lower()
-            if file_type == 'txt':
-                return file.read().decode('utf-8', errors='ignore')
-            elif file_type == 'pdf':
-                reader = PyPDF2.PdfReader(file)
-                return '\n'.join(page.extract_text() or '' for page in reader.pages)
-            elif file_type == 'docx':
-                doc = Document(file)
-                return '\n'.join(paragraph.text for paragraph in doc.paragraphs)
-            return ''
+    for file in uploaded_files:
+        if file.name.endswith('.zip'):
+            with zipfile.ZipFile(file, 'r') as z:
+                for inner_file_name in z.namelist():
+                    if inner_file_name.endswith(('.txt', '.pdf', '.docx')):
+                        with z.open(inner_file_name) as inner_file:
+                            content = extract_text(inner_file)
+                            st.session_state.detector.add_document(inner_file_name, content)
+                            st.session_state.documents.append({
+                                'title': inner_file_name,
+                                'content': content,
+                                'word_count': len(content.split())
+                            })
+        else:
+            content = extract_text(file)
+            st.session_state.detector.add_document(file.name, content)
+            st.session_state.documents.append({
+                'title': file.name,
+                'content': content,
+                'word_count': len(content.split())
+            })
 
-
-        for file in uploaded_files:
-            if file.name.endswith('.zip'):
-                with zipfile.ZipFile(file, 'r') as z:
-                    for inner_file_name in z.namelist():
-                        if inner_file_name.endswith(('.txt', '.pdf', '.docx')):
-                            with z.open(inner_file_name) as inner_file:
-                                content = extract_text(inner_file)
-                                st.session_state.detector.add_document(inner_file_name, content)
-                                st.session_state.documents.append({
-                                    'title': inner_file_name,
-                                    'content': content,
-                                    'word_count': len(content.split())
-                                })
-            else:
-                content = extract_text(file)
-                st.session_state.detector.add_document(file.name, content)
-                st.session_state.documents.append({
-                    'title': file.name,
-                    'content': content,
-                    'word_count': len(content.split())
-                })
-
-        st.sidebar.success("Fichiers importés avec succès!")
-        st.session_state.analysis_done = False
+    st.sidebar.success("Fichiers importés avec succès!")
+    st.session_state.analysis_done = False
 
 # Bouton de suppression des documents
 if st.sidebar.button("🗑️ Supprimer tous les documents"):
@@ -373,10 +541,6 @@ if st.sidebar.button("🗑️ Supprimer tous les documents"):
 
 # Interface principale
 col1, col2 = st.columns([1, 1])
-
-
-
-
 
 with col1:
     st.header("📋 Documents Chargés")
@@ -397,10 +561,9 @@ with col1:
         if to_remove is not None:
             del st.session_state.documents[to_remove]
             del st.session_state.detector.documents[to_remove]
-            st.session_state.analysis_done = False  # Réinitialiser état d'analyse
+            st.session_state.analysis_done = False
             st.success("Document supprimé avec succès.")
             st.rerun()
- # ✅ Recharge immédiat
 
         # Bouton d'analyse
         if st.button("🔍 Analyser les Documents", type="primary", use_container_width=True):
@@ -410,32 +573,47 @@ with col1:
                 with st.spinner("Analyse en cours..."):
                     try:
                         model = st.session_state.get("selected_model", "Cosine Similarity (TF-IDF)")
+                        
                         if model == "Cosine Similarity (TF-IDF)":
                             results = st.session_state.detector.detect_plagiarism()
+                            
                         elif model == "SBERT":
-                            st.warning("SBERT pas encore implémenté.")
+                            results = detect_plagiarism_sbert(
+                                documents=st.session_state.detector.documents,
+                                threshold=st.session_state.detector.threshold
+                            )
+                            st.session_state.detector.similarities = results
+                            
                         elif model == "LSTM":
-                            st.warning("LSTM pas encore implémenté.")
+                            max_len = st.session_state.get("max_sequence_length", 100)
+                            results = detect_plagiarism_lstm(
+                                documents=st.session_state.detector.documents,
+                                model=st.session_state.lstm_model,
+                                tokenizer=st.session_state.tokenizer,
+                                threshold=st.session_state.detector.threshold,
+                                max_length=max_len
+                            )
+                            st.session_state.detector.similarities = results
+                            
                         elif model == "SVM":
-
                             results = detect_plagiarism_svm(
                                 documents=st.session_state.detector.documents,
                                 model=st.session_state.svm_model,
                                 scaler=st.session_state.scaler,
                                 threshold=st.session_state.detector.threshold
                             )
-
                             st.session_state.detector.similarities = results
 
-                            if not results:
-                                st.warning("Aucune similarité détectée par le modèle SVM.")
-                            else:
-                                st.write("🔍 Résultats SVM bruts :")
-                                st.write(results)
                         st.session_state.analysis_done = True
-                        st.success("Analyse terminée!")
+                        if results:
+                            st.success(f"Analyse terminée avec {model}!")
+                        else:
+                            st.warning("Aucun résultat obtenu. Vérifiez vos modèles et données.")
+                            
                     except Exception as e:
                         st.error(f"Erreur lors de l'analyse: {str(e)}")
+                        st.error("Détails de l'erreur pour le débogage:")
+                        st.code(str(e))
     else:
         st.info("Aucun document chargé. Utilisez la barre latérale pour ajouter des documents.")
 
@@ -443,6 +621,10 @@ with col2:
     st.header("📊 Résultats de l'Analyse")
 
     if st.session_state.analysis_done and st.session_state.detector.similarities:
+        # Afficher le modèle utilisé
+        current_model = st.session_state.get("selected_model", "Cosine Similarity (TF-IDF)")
+        st.info(f"Résultats obtenus avec: **{current_model}**")
+        
         # Tableau des résultats
         df_results = st.session_state.detector.get_detailed_results()
         st.subheader("Résultats Détaillés")
@@ -471,8 +653,6 @@ with col2:
         st.subheader("Visualisation des Similarités")
 
         similarities_data = []
-        colors = []
-
         for s in st.session_state.detector.similarities:
             comparison = f"{s['doc1_title'][:15]}... vs {s['doc2_title'][:15]}..."
             similarities_data.append({
@@ -491,7 +671,7 @@ with col2:
                         'Plagiat Détecté': '#FF6B6B',
                         'Document Original': '#4ECDC4'
                     },
-                    title='Scores de Similarité par Paire de Documents')
+                    title=f'Scores de Similarité par Paire de Documents ({current_model})')
 
         # Ligne de seuil
         fig.add_hline(y=threshold,
@@ -502,8 +682,8 @@ with col2:
         fig.update_layout(xaxis_tickangle=-45, height=500)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Matrice de similarité
-        if len(st.session_state.documents) <= 10:  # Limite pour la lisibilité
+        # Matrice de similarité (seulement pour TF-IDF)
+        if current_model == "Cosine Similarity (TF-IDF)" and len(st.session_state.documents) <= 10:
             st.subheader("Matrice de Similarité")
 
             # Calcul de la matrice de similarité complète
@@ -535,29 +715,109 @@ with st.expander("ℹ️ Comment utiliser ce détecteur de plagiat"):
     ### Instructions d'utilisation:
     
     1. **Ajouter des documents**: Utilisez la barre latérale pour ajouter vos documents un par un
-    2. **Ou charger des exemples**: Cliquez sur "Charger des Exemples" pour tester avec des données de démonstration
-    3. **Configurer le seuil**: Ajustez le seuil de détection selon vos besoins (70% par défaut)
-    4. **Analyser**: Cliquez sur "Analyser les Documents" pour détecter les similarités
-    5. **Interpréter les résultats**: 
+    2. **Ou charger des fichiers**: Importez des fichiers TXT, PDF, DOCX ou ZIP
+    3. **Choisir le modèle**: Sélectionnez le modèle de similarité (TF-IDF, SBERT, LSTM, SVM)
+    4. **Configurer le seuil**: Ajustez le seuil de détection selon vos besoins (70% par défaut)
+    5. **Analyser**: Cliquez sur "Analyser les Documents" pour détecter les similarités
+    6. **Interpréter les résultats**: 
        - Rouge = Plagiat détecté (au-dessus du seuil)
        - Vert = Document original (en-dessous du seuil)
     
-    ### Méthode utilisée:
-    - **TF-IDF**: Calcul de l'importance des mots dans chaque document
-    - **Similarité cosinus**: Mesure de l'angle entre les vecteurs de documents
-    - **Seuil personnalisable**: Vous définissez à partir de quel pourcentage considérer un plagiat
+    ### Modèles disponibles:
     
-    ### Limites:
-    - Détection basée sur la similarité lexicale
-    - Ne détecte pas la paraphrase sophistiquée
-    - Sensible à la longueur des documents
+    #### 1. **Cosine Similarity (TF-IDF)**
+    - Méthode classique basée sur la fréquence des termes
+    - Rapide et efficace pour la plupart des cas
+    - Idéal pour détecter les similarités lexicales directes
+    
+    #### 2. **SBERT (Sentence-BERT)**
+    - Modèle de langue pré-entraîné
+    - Comprend le sens sémantique des phrases
+    - Excellent pour détecter les paraphrases
+    
+    #### 3. **LSTM (Long Short-Term Memory)**
+    - Réseau de neurones récurrents
+    - Analyse les séquences de mots
+    - Bon pour capturer les dépendances à long terme
+    
+    #### 4. **SVM (Support Vector Machine)**
+    - Modèle d'apprentissage supervisé
+    - Utilise des features avancées basées sur SBERT
+    - Très précis avec un entraînement approprié
+    
+    ### Paramètres spéciaux:
+    - **LSTM**: Vous pouvez ajuster la longueur maximale des séquences
+    - **Tous les modèles**: Le seuil de détection est personnalisable
+    
+    ### Formats de fichiers supportés:
+    - **TXT**: Fichiers texte brut
+    - **PDF**: Documents PDF (extraction automatique du texte)
+    - **DOCX**: Documents Word
+    - **ZIP**: Archives contenant plusieurs fichiers
+    
+    ### Limites et considérations:
+    - **TF-IDF**: Sensible à la similarité lexicale, moins efficace pour les paraphrases
+    - **SBERT**: Nécessite une connexion internet pour le premier téléchargement
+    - **LSTM**: Dépend de la qualité du modèle pré-entraîné
+    - **SVM**: Nécessite les fichiers de modèle (svm_model2.joblib, scaler2.joblib)
+    - **Performance**: Les modèles deep learning (SBERT, LSTM, SVM) sont plus lents mais plus précis
+    
+    ### Conseils d'utilisation:
+    - Utilisez **TF-IDF** pour une analyse rapide de similarité lexicale
+    - Utilisez **SBERT** pour détecter les paraphrases et reformulations
+    - Utilisez **LSTM** pour analyser les structures séquentielles
+    - Utilisez **SVM** pour la plus haute précision (si le modèle est bien entraîné)
+    - Ajustez le seuil selon votre contexte (plus strict = moins de faux positifs)
+    
+    ### Interprétation des résultats:
+    - **Scores élevés (>80%)**: Plagiat très probable
+    - **Scores moyens (50-80%)**: Similarité significative, à examiner
+    - **Scores faibles (<50%)**: Documents probablement originaux
+    - **Matrice de similarité**: Vue d'ensemble des relations entre tous les documents
     """)
 
-# Footer
+# Informations sur les modèles chargés
+st.sidebar.header("📊 État des Modèles")
+with st.sidebar.expander("Modèles Disponibles", expanded=False):
+    # Vérification TF-IDF
+    st.write("✅ **TF-IDF**: Toujours disponible")
+    
+    # Vérification SBERT
+    if st.session_state.sbert_model is not None:
+        st.write("✅ **SBERT**: Modèle chargé")
+    else:
+        st.write("❌ **SBERT**: Non disponible")
+    
+    # Vérification LSTM
+    if st.session_state.lstm_model is not None and st.session_state.tokenizer is not None:
+        st.write("✅ **LSTM**: Modèle et tokenizer chargés")
+        st.write(f"   - Modèle: lstm_model2.h5")
+        st.write(f"   - Tokenizer: tokenizer2.joblib")
+    else:
+        st.write("❌ **LSTM**: Modèle ou tokenizer manquant")
+        if st.session_state.lstm_model is None:
+            st.write("   - ❌ lstm_model2.h5 non trouvé")
+        if st.session_state.tokenizer is None:
+            st.write("   - ❌ tokenizer2.joblib non trouvé")
+    
+    # Vérification SVM
+    if st.session_state.svm_model is not None and st.session_state.scaler is not None:
+        st.write("✅ **SVM**: Modèle et scaler chargés")
+        st.write(f"   - Modèle: svm_model2.joblib")
+        st.write(f"   - Scaler: scaler2.joblib")
+    else:
+        st.write("❌ **SVM**: Modèle ou scaler manquant")
+        if st.session_state.svm_model is None:
+            st.write("   - ❌ svm_model2.joblib non trouvé")
+        if st.session_state.scaler is None:
+            st.write("   - ❌ scaler2.joblib non trouvé")
+
+# Footer avec informations techniques
 st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: #7F8C8D;'>"
-    "Détecteur de Plagiat IA - Basé sur TF-IDF et Similarité Cosinus"
-    "</div>",
-    unsafe_allow_html=True
-)
+st.markdown("""
+<div style='text-align: center; color: #7F8C8D;'>
+    <p><strong>Détecteur de Plagiat IA Multi-Modèles</strong></p>
+    <p>Supportant TF-IDF, SBERT, LSTM et SVM • Développé avec Streamlit et TensorFlow/Scikit-learn</p>
+    <p>Pour de meilleurs résultats, assurez-vous que tous les fichiers de modèles sont présents dans le dossier de l'application</p>
+</div>
+""", unsafe_allow_html=True)
