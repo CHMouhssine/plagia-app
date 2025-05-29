@@ -9,5 +9,5 @@ seaborn
 plotly
 PyPDF2
 python-docx
-tensorflow>=2.15
+tensorflow>=2.11,<2.16
 
